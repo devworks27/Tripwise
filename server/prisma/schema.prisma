@@ -1,0 +1,17 @@
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Itinerary {
+  id          Int    @id @default(autoincrement())
+  name        String
+  location    String
+  category    String
+  description String
+  image       String
+}
