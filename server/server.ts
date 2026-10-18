@@ -1,8 +1,7 @@
 import express, { Request, Response } from 'express';
 import cors from 'cors';
-import sqlite3 from 'sqlite3';
-import { open, Database } from 'sqlite';
 import path from 'path';
+import fs from 'fs';
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -10,62 +9,194 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
-// Database instance
-let db: Database;
+// Universal Database Interface
+export interface AppDatabase {
+  exec(sql: string): Promise<any>;
+  all<T = any>(query: string, params?: any[]): Promise<T[]>;
+  get<T = any>(query: string, params?: any[]): Promise<T | undefined>;
+  run(query: string, params?: any[]): Promise<{ lastID: number; changes: number }>;
+}
 
+let db: AppDatabase;
+
+// Fallback JSON persistence engine for environments without native glibc/C++ bindings (e.g. Render Linux)
+function createFallbackStorageEngine(): AppDatabase {
+  const jsonPath = path.resolve(__dirname, 'dev_itinerary.json');
+  let memoryItems: any[] = [];
+  let nextId = 1;
+
+  try {
+    if (fs.existsSync(jsonPath)) {
+      const data = fs.readFileSync(jsonPath, 'utf-8');
+      memoryItems = JSON.parse(data);
+      nextId = memoryItems.reduce((max: number, item: any) => Math.max(max, item.id || 0), 0) + 1;
+    }
+  } catch (e) {
+    memoryItems = [];
+  }
+
+  const persist = async () => {
+    try {
+      await fs.promises.writeFile(jsonPath, JSON.stringify(memoryItems, null, 2), 'utf-8');
+    } catch (e) {
+      console.error('[TripWise Server] Failed to save itinerary to disk:', e);
+    }
+  };
+
+  return {
+    async exec(_sql: string) {
+      return;
+    },
+    async all<T = any>(query: string, params: any[] = []): Promise<T[]> {
+      let list = [...memoryItems];
+      if (query.includes('WHERE status = ?')) {
+        const status = params[0];
+        list = list.filter(item => item.status === status);
+      }
+      if (query.includes('ORDER BY name ASC')) {
+        list.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+      } else if (query.includes('ORDER BY travel_date ASC')) {
+        list.sort((a, b) => (a.travel_date || '').localeCompare(b.travel_date || ''));
+      } else if (query.includes('ORDER BY estimated_cost DESC')) {
+        list.sort((a, b) => (b.estimated_cost || 0) - (a.estimated_cost || 0));
+      } else {
+        list.sort((a, b) => (b.id || 0) - (a.id || 0));
+      }
+
+      if (query.includes('SELECT category, count(*) as count')) {
+        const counts: Record<string, number> = {};
+        for (const item of memoryItems) {
+          const cat = item.category || 'other';
+          counts[cat] = (counts[cat] || 0) + 1;
+        }
+        return Object.entries(counts).map(([category, count]) => ({ category, count })) as any;
+      }
+
+      return list as T[];
+    },
+    async get<T = any>(query: string, params: any[] = []): Promise<T | undefined> {
+      if (query.includes('SELECT count(*) as count FROM itinerary')) {
+        if (query.includes("WHERE status = 'planned'")) {
+          return { count: memoryItems.filter(i => i.status === 'planned').length } as any;
+        }
+        if (query.includes("WHERE status = 'visited'")) {
+          return { count: memoryItems.filter(i => i.status === 'visited').length } as any;
+        }
+        return { count: memoryItems.length } as any;
+      }
+      if (query.includes('SELECT count(*) as total FROM itinerary')) {
+        return { total: memoryItems.length } as any;
+      }
+      if (query.includes('SELECT SUM(estimated_cost) as totalCost FROM itinerary')) {
+        const totalCost = memoryItems.reduce((acc, i) => acc + (Number(i.estimated_cost) || 0), 0);
+        return { totalCost } as any;
+      }
+      if (query.includes('WHERE name = ? AND location = ?')) {
+        return memoryItems.find(i => i.name === params[0] && i.location === params[1]) as any;
+      }
+      if (query.includes('WHERE id = ?')) {
+        const id = Number(params[0]);
+        return memoryItems.find(i => i.id === id) as any;
+      }
+      return undefined;
+    },
+    async run(query: string, params: any[] = []) {
+      if (query.startsWith('INSERT INTO itinerary')) {
+        const [destination_id, name, location, category, description, image, travel_date, notes, status, estimated_cost] = params;
+        const newItem = {
+          id: nextId++,
+          destination_id: destination_id || null,
+          name,
+          location,
+          category,
+          description,
+          image,
+          travel_date: travel_date || null,
+          notes: notes || '',
+          status: status || 'planned',
+          estimated_cost: Number(estimated_cost) || 0,
+          created_at: new Date().toISOString().replace('T', ' ').slice(0, 19)
+        };
+        memoryItems.push(newItem);
+        await persist();
+        return { lastID: newItem.id, changes: 1 };
+      }
+      if (query.startsWith('UPDATE itinerary')) {
+        const id = Number(params[4]);
+        const item = memoryItems.find(i => i.id === id);
+        if (item) {
+          if (params[0] !== null) item.travel_date = params[0];
+          if (params[1] !== null) item.notes = params[1];
+          if (params[2] !== null) item.status = params[2];
+          if (params[3] !== null) item.estimated_cost = Number(params[3]);
+          await persist();
+          return { lastID: id, changes: 1 };
+        }
+        return { lastID: id, changes: 0 };
+      }
+      if (query.startsWith('DELETE FROM itinerary')) {
+        const id = Number(params[0]);
+        const initialLen = memoryItems.length;
+        memoryItems = memoryItems.filter(i => i.id !== id);
+        await persist();
+        return { lastID: id, changes: initialLen - memoryItems.length };
+      }
+      return { lastID: 0, changes: 0 };
+    }
+  };
+}
+
+// Database Initializer (attempts native SQLite first, falls back to portable JSON engine)
 async function initDatabase() {
   const dbPath = path.resolve(__dirname, 'dev.db');
-  db = await open({
-    filename: dbPath,
-    driver: sqlite3.Database
-  });
+  try {
+    const sqlite3Module = await import('sqlite3');
+    const { open } = await import('sqlite');
+    const sqlite3 = (sqlite3Module as any).default || sqlite3Module;
 
-  // Create table if it doesn't exist
-  await db.exec(`
-    CREATE TABLE IF NOT EXISTS itinerary (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      destination_id TEXT,
-      name TEXT NOT NULL,
-      location TEXT NOT NULL,
-      category TEXT,
-      description TEXT,
-      image TEXT,
-      travel_date TEXT,
-      notes TEXT,
-      status TEXT DEFAULT 'planned',
-      estimated_cost REAL DEFAULT 0,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
+    const nativeDb = await open({
+      filename: dbPath,
+      driver: sqlite3.Database
+    });
 
-  // Ensure columns exist for seamless backwards compatibility
-  const columns = await db.all<{ name: string }[]>("PRAGMA table_info(itinerary)");
-  const colNames = columns.map((c: any) => c.name);
+    await nativeDb.exec(`
+      CREATE TABLE IF NOT EXISTS itinerary (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        destination_id TEXT,
+        name TEXT NOT NULL,
+        location TEXT NOT NULL,
+        category TEXT,
+        description TEXT,
+        image TEXT,
+        travel_date TEXT,
+        notes TEXT,
+        status TEXT DEFAULT 'planned',
+        estimated_cost REAL DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
 
-  if (!colNames.includes('destination_id')) {
-    await db.exec('ALTER TABLE itinerary ADD COLUMN destination_id TEXT');
-  }
-  if (!colNames.includes('travel_date')) {
-    await db.exec('ALTER TABLE itinerary ADD COLUMN travel_date TEXT');
-  }
-  if (!colNames.includes('notes')) {
-    await db.exec('ALTER TABLE itinerary ADD COLUMN notes TEXT');
-  }
-  if (!colNames.includes('status')) {
-    await db.exec("ALTER TABLE itinerary ADD COLUMN status TEXT DEFAULT 'planned'");
-  }
-  if (!colNames.includes('estimated_cost')) {
-    await db.exec('ALTER TABLE itinerary ADD COLUMN estimated_cost REAL DEFAULT 0');
-  }
-  if (!colNames.includes('created_at')) {
-    await db.exec("ALTER TABLE itinerary ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP");
-  }
+    const columns = await nativeDb.all<{ name: string }[]>("PRAGMA table_info(itinerary)");
+    const colNames = columns.map((c: any) => c.name);
 
-  console.log(`[TripWise Server] SQLite database connected and migrated at ${dbPath}`);
+    if (!colNames.includes('destination_id')) await nativeDb.exec('ALTER TABLE itinerary ADD COLUMN destination_id TEXT');
+    if (!colNames.includes('travel_date')) await nativeDb.exec('ALTER TABLE itinerary ADD COLUMN travel_date TEXT');
+    if (!colNames.includes('notes')) await nativeDb.exec('ALTER TABLE itinerary ADD COLUMN notes TEXT');
+    if (!colNames.includes('status')) await nativeDb.exec("ALTER TABLE itinerary ADD COLUMN status TEXT DEFAULT 'planned'");
+    if (!colNames.includes('estimated_cost')) await nativeDb.exec('ALTER TABLE itinerary ADD COLUMN estimated_cost REAL DEFAULT 0');
+    if (!colNames.includes('created_at')) await nativeDb.exec("ALTER TABLE itinerary ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP");
+
+    db = nativeDb;
+    console.log(`[TripWise Server] SQLite database connected and migrated at ${dbPath}`);
+  } catch (err: any) {
+    console.warn(`[TripWise Server] Native SQLite driver unavailable (${err.message}). Using portable persistent storage.`);
+    db = createFallbackStorageEngine();
+  }
 }
 
 initDatabase().catch(err => {
   console.error('[TripWise Server] Database initialization error:', err);
+  db = createFallbackStorageEngine();
 });
 
 // Destination Model Interface
